@@ -4,13 +4,7 @@ use crate::token_source::{
     HtmlEmbeddedLanguage, HtmlLexContext, HtmlReLexContext, RestrictedExpressionStopAt,
     TextExpressionKind,
 };
-use biome_html_syntax::HtmlSyntaxKind::{
-    ANIMATE_KW, AS_KW, ATTACH_KW, AWAIT_KW, BIND_KW, CATCH_KW, CLASS_KW, CLIENT_KW, COMMENT,
-    CONST_KW, DEBUG_KW, DEFINE_KW, DOCTYPE_KW, EACH_KW, ELSE_KW, EOF, ERROR_TOKEN, HTML_KW,
-    HTML_LITERAL, HTML_STRING_LITERAL, IDENT, IF_KW, IN_KW, IS_KW, KEY_KW, NEWLINE, OUT_KW,
-    RENDER_KW, SERVER_KW, SET_KW, SNIPPET_KW, STYLE_KW, THEN_KW, TOMBSTONE, TRANSITION_KW,
-    UNICODE_BOM, USE_KW, WHITESPACE,
-};
+use biome_html_syntax::HtmlSyntaxKind::*;
 use biome_html_syntax::{HtmlSyntaxKind, T, TextLen, TextSize};
 use biome_parser::diagnostic::ParseDiagnostic;
 use biome_parser::lexer::{Lexer, LexerCheckpoint, LexerWithCheckpoint, ReLexer, TokenFlags};
@@ -30,6 +24,10 @@ pub(crate) struct HtmlLexer<'src> {
     preceding_line_break: bool,
     after_newline: bool,
     unicode_bom_length: usize,
+    /// Set to `true` after the Astro frontmatter closing fence (`---`) has been
+    /// consumed. Once set, the `Regular` context will no longer treat `---` as a
+    /// `FENCE` token, allowing `---` to appear as plain text in HTML content.
+    after_frontmatter: bool,
 }
 
 enum IdentifierContext {
@@ -62,7 +60,14 @@ impl<'src> HtmlLexer<'src> {
             after_newline: false,
             current_flags: TokenFlags::empty(),
             unicode_bom_length: 0,
+            after_frontmatter: false,
         }
+    }
+
+    /// Sets the `after_frontmatter` flag. When `true`, `---` in the `Regular`
+    /// context is treated as plain HTML text rather than a `FENCE` token.
+    pub fn set_after_frontmatter(&mut self, value: bool) {
+        self.after_frontmatter = value;
     }
 
     /// Consume a token in the [HtmlLexContext::InsideTag] context.
@@ -265,10 +270,10 @@ impl<'src> HtmlLexer<'src> {
             EXL if self.current() == T![<] => self.consume_byte(T![!]),
             SLH if self.current() == T![<] => self.consume_byte(T![/]),
             COM if self.current() == T![<] => self.consume_byte(T![,]),
-            MIN if self.at_frontmatter_edge() => self.consume_frontmatter_edge(),
+            MIN if !self.after_frontmatter && self.at_frontmatter_edge() => {
+                self.consume_frontmatter_edge()
+            }
             BEO if self.at_svelte_opening_block() => self.consume_svelte_opening_block(),
-            BTO => self.consume_byte(T!['[']),
-            BTC => self.consume_byte(T![']']),
             BEO => {
                 if self.at_opening_double_text_expression() {
                     self.consume_l_double_text_expression()
@@ -571,6 +576,7 @@ impl<'src> HtmlLexer<'src> {
             MIN => {
                 debug_assert!(self.at_frontmatter_edge());
                 self.advance(3);
+                self.after_frontmatter = true;
                 T![---]
             }
             _ => {
@@ -753,7 +759,11 @@ impl<'src> HtmlLexer<'src> {
                     }
                 }
                 IdentifierContext::Vue => {
-                    if is_attribute_name_byte_vue(byte) {
+                    if byte == b':' && is_vue_directive_prefix_bytes(&buffer[..len]) {
+                        break;
+                    }
+
+                    if is_attribute_name_byte_vue(byte) || byte == b':' {
                         if len < BUFFER_SIZE {
                             buffer[len] = byte;
                             len += 1;
@@ -1316,6 +1326,7 @@ impl<'src> Lexer<'src> for HtmlLexer<'src> {
             current_flags,
             current_kind,
             after_line_break,
+            after_whitespace: _,
             unicode_bom_length,
             diagnostics_pos,
         } = checkpoint;
@@ -1423,6 +1434,10 @@ fn is_astro_directive_keyword_bytes(bytes: &[u8]) -> bool {
     )
 }
 
+fn is_vue_directive_prefix_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"v-")
+}
+
 /// Identifiers can contain letters, numbers and `_`
 fn is_at_continue_identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
@@ -1453,6 +1468,7 @@ impl<'src> LexerWithCheckpoint<'src> for HtmlLexer<'src> {
             current_flags: self.current_flags,
             current_kind: self.current_kind,
             after_line_break: self.after_newline,
+            after_whitespace: false,
             unicode_bom_length: self.unicode_bom_length,
             diagnostics_pos: self.diagnostics.len() as u32,
         }
